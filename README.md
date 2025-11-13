@@ -1,4 +1,4 @@
-# Clud potint to 2D converter
+# Cloud point to 2D converter
 
 
 ```bash 
