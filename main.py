@@ -4,7 +4,9 @@ import cv2
 import sys
 import open3d as o3d
 import time
-from functools import wraps
+from functools import wraps, lru_cache
+import os
+import laspy
 
 
 def measure_time(func):
@@ -25,22 +27,7 @@ def lidar_to_image(
 ):
     """
     Tworzy obraz 2D z chmury punktów LiDAR przez rzutowanie na wybraną płaszczyznę.
-
-    Args:
-        points (np.ndarray): chmura punktów (N, 3) lub (N, 4) [x, y, z, (intensity)].
-        axis (str): oś do 'skompresowania' → 'x', 'y' lub 'z'.
-                    - 'z' → rzut na XY (widok z góry)
-                    - 'y' → rzut na XZ (widok z boku)
-                    - 'x' → rzut na YZ (widok z przodu)
-        res (float): rozdzielczość w metrach na piksel (jeśli None, dobierana automatycznie).
-        target_size (int): docelowy rozmiar obrazu w pikselach (dla auto-res).
-        limits (dict): np. {'x':(-50,50), 'y':(-50,50), 'z':(-5,5)} — zakresy dla osi.
-        value_mode (str): 'height' (z), 'intensity' lub 'count'.
-
-    Returns:
-        img (np.ndarray): obraz 2D w skali 0–255 (uint8)
-        limits (dict): użyte zakresy osi
-        res (float): faktyczna rozdzielczość [m/pix]
+    Zoptymalizowana wersja z operacjami wektorowymi.
     """
 
     # Automatyczne wyznaczenie zakresów, jeśli brak
@@ -63,50 +50,67 @@ def lidar_to_image(
         res = max_range / target_size
 
     # Wybór osi rzutowania
-    if axis == "z":  # Bird's-eye view
+    if axis == "z":
         plane_axes = ("x", "y")
         value_axis = "z"
-    elif axis == "y":  # Widok z boku
+        plane_idx = (0, 1)
+        value_idx = 2
+    elif axis == "y":
         plane_axes = ("x", "z")
         value_axis = "y"
-    elif axis == "x":  # Widok z przodu
+        plane_idx = (0, 2)
+        value_idx = 1
+    elif axis == "x":
         plane_axes = ("y", "z")
         value_axis = "x"
+        plane_idx = (1, 2)
+        value_idx = 0
     else:
         raise ValueError("axis must be one of 'x', 'y', 'z'")
 
-    # Ekstrakcja współrzędnych
-    coord = {k: points[:, i] for i, k in enumerate(["x", "y", "z"])}
-    coord["intensity"] = points[:, 3] if points.shape[1] > 3 else np.ones(len(points))
+    # Ekstrakcja współrzędnych (wektorowo)
+    pts_3d = points[:, :3]
+    intensity = points[:, 3] if points.shape[1] > 3 else np.ones(len(points))
 
-    # Filtrowanie wg zakresu
+    # Filtrowanie wg zakresu (wektorowo)
     mask = np.ones(len(points), dtype=bool)
-    for ax in ["x", "y", "z"]:
-        mask &= (coord[ax] >= limits[ax][0]) & (coord[ax] <= limits[ax][1])
-    for ax in coord:
-        coord[ax] = coord[ax][mask]
+    limits_arr = np.array([limits["x"], limits["y"], limits["z"]])
+    for i in range(3):
+        mask &= (pts_3d[:, i] >= limits_arr[i, 0]) & (pts_3d[:, i] <= limits_arr[i, 1])
+    
+    pts_filtered = pts_3d[mask]
+    intensity_filtered = intensity[mask]
 
-    # Zamiana współrzędnych na piksele
-    xpix = ((coord[plane_axes[0]] - limits[plane_axes[0]][0]) / res).astype(np.int32)
-    ypix = ((coord[plane_axes[1]] - limits[plane_axes[1]][0]) / res).astype(np.int32)
+    # Zamiana współrzędnych na piksele (wektorowo)
+    plane_coords = pts_filtered[:, plane_idx]
+    plane_limits = np.array([limits[plane_axes[0]], limits[plane_axes[1]]])
+    
+    xpix = ((plane_coords[:, 0] - plane_limits[0, 0]) / res).astype(np.int32)
+    ypix = ((plane_coords[:, 1] - plane_limits[1, 0]) / res).astype(np.int32)
 
-    w = int((limits[plane_axes[0]][1] - limits[plane_axes[0]][0]) / res)
-    h = int((limits[plane_axes[1]][1] - limits[plane_axes[1]][0]) / res)
+    w = int((plane_limits[0, 1] - plane_limits[0, 0]) / res)
+    h = int((plane_limits[1, 1] - plane_limits[1, 0]) / res)
     img = np.zeros((h, w), dtype=np.float32)
 
-    # Wartość piksela (height / intensity / count)
+    # Wartość piksela
     if value_mode == "height":
-        val = coord[value_axis]
+        val = pts_filtered[:, value_idx]
     elif value_mode == "intensity":
-        val = coord["intensity"]
+        val = intensity_filtered
     elif value_mode == "count":
-        val = np.ones_like(coord["x"])
+        val = np.ones(len(pts_filtered))
     else:
         raise ValueError("value_mode must be 'height', 'intensity' or 'count'")
 
-    for xi, yi, v in zip(xpix, ypix, val):
-        if 0 <= xi < w and 0 <= yi < h:
-            img[yi, xi] = max(img[yi, xi], v)
+    # Wektorowa agregacja pikseli zamiast pętli
+    valid_mask = (xpix >= 0) & (xpix < w) & (ypix >= 0) & (ypix < h)
+    xpix_valid = xpix[valid_mask]
+    ypix_valid = ypix[valid_mask]
+    val_valid = val[valid_mask]
+    
+    # Konwersja 2D indeksów na 1D
+    indices = ypix_valid * w + xpix_valid
+    np.maximum.at(img.ravel(), indices, val_valid)
 
     img_norm = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX)
     return img_norm.astype(np.uint8), limits, res
@@ -116,8 +120,9 @@ def lidar_to_image(
 def image_to_coords(img, res, limits, axis="z"):
     """
     Zamienia jasne piksele obrazu 2D na współrzędne punktów rzeczywistych.
+    Zoptymalizowana wersja.
     """
-    ys, xs = np.where(img > 50)  # wybór jasnych pikseli
+    ys, xs = np.where(img > 50)
 
     if axis == "z":
         x_real = xs * res + limits["x"][0]
@@ -133,10 +138,40 @@ def image_to_coords(img, res, limits, axis="z"):
         return np.vstack((y_real, z_real)).T, ("Y", "Z")
 
 
+@lru_cache(maxsize=8)
+@measure_time
+def load_point_cloud(path):
+    """
+    Ładuje chmurę punktów z cache'em dla powtórnych wczytań.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext in [".ply", ".pcd", ".xyz", ".obj", ".off"]:
+        pcd = o3d.io.read_point_cloud(path)
+        points = np.asarray(pcd.points)
+        # Obsługa 2D - dodaj kolumnę Z jeśli brakuje
+        if points.shape[1] == 2:
+            points = np.hstack([points, np.zeros((len(points), 1))])
+        if pcd.has_colors():
+            intensity = np.mean(np.asarray(pcd.colors), axis=1)
+            points = np.hstack([points, intensity.reshape(-1, 1)])
+        return points
+    elif ext in [".las", ".laz"]:
+        las = laspy.read(path)
+        points = np.vstack((las.x, las.y, las.z)).T
+        if hasattr(las, "intensity"):
+            intensity = las.intensity
+            points = np.hstack([points, intensity.reshape(-1, 1)])
+        return points
+    elif ext in [".csv", ".txt"]:
+        data = np.loadtxt(path, delimiter=",")
+        return data
+    else:
+        raise ValueError(f"Nieobsługiwany format pliku: {ext}")
+
+
 @measure_time
 def main(path, axis="z"):
-    pcd = o3d.io.read_point_cloud(path)
-    points = np.asarray(pcd.points)
+    points = load_point_cloud(path)
 
     # Rzutowanie
     img, limits, res = lidar_to_image(points, axis=axis, res=None, target_size=200)
@@ -147,8 +182,18 @@ def main(path, axis="z"):
     # Konwersja obrazu na współrzędne
     coords_2d, labels = image_to_coords(img, res=res, limits=limits, axis=axis)
 
-    for coord in coords_2d:
+    # Zapis punktów do pliku tekstowego
+    out_file = "coords_2d.txt"
+    header = f"{labels[0]},{labels[1]}\n"
+    np.savetxt(out_file, coords_2d, fmt="%.6f", delimiter=",", header=header, comments='')
+    print(f"Punkty zapisano do pliku: {out_file}")
+
+    # Opcjonalnie: wyświetlanie kilku pierwszych punktów
+    max_show = 10
+    for coord in coords_2d[:max_show]:
         print(f"{labels[0]}: {coord[0]:.2f}, {labels[1]}: {coord[1]:.2f}")
+    if len(coords_2d) > max_show:
+        print(f"... (pominięto {len(coords_2d) - max_show} punktów)")
 
 
 if __name__ == "__main__":
