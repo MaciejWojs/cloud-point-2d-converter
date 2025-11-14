@@ -3,8 +3,23 @@ import numpy as np
 import cv2
 import sys
 import open3d as o3d
+import time
+from functools import wraps
 
 
+def measure_time(func):
+    """Dekorator mierzący czas wykonywania funkcji."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.time()
+        result = func(*args, **kwargs)
+        elapsed = time.time() - start
+        print(f"[BENCHMARK]  {func.__name__} wykonał się w {elapsed:.4f} sekundach")
+        return result
+    return wrapper
+
+
+@measure_time
 def lidar_to_image(
     points, axis="z", res=None, target_size=512, limits=None, value_mode="height"
 ):
@@ -97,6 +112,7 @@ def lidar_to_image(
     return img_norm.astype(np.uint8), limits, res
 
 
+@measure_time
 def image_to_coords(img, res, limits, axis="z"):
     """
     Zamienia jasne piksele obrazu 2D na współrzędne punktów rzeczywistych.
@@ -117,6 +133,7 @@ def image_to_coords(img, res, limits, axis="z"):
         return np.vstack((y_real, z_real)).T, ("Y", "Z")
 
 
+@measure_time
 def main(path, axis="z"):
     pcd = o3d.io.read_point_cloud(path)
     points = np.asarray(pcd.points)
